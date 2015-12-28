@@ -11,6 +11,10 @@ import org.apache.avro.io.DatumWriter;
 import org.apache.avro.reflect.ReflectData;
 import org.apache.avro.reflect.ReflectDatumWriter;
 import org.apache.commons.cli.*;
+import org.apache.commons.compress.archivers.ArchiveEntry;
+import org.apache.commons.compress.archivers.ArchiveInputStream;
+import org.apache.commons.compress.archivers.ArchiveStreamFactory;
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.io.output.ByteArrayOutputStream;
@@ -131,7 +135,7 @@ public class CopyToAvro {
                         if ("zip".equalsIgnoreCase(extension)) {
 
                             try (InputStream stream = new FileInputStream(child)) {
-                                ZipInputStream zis = new ZipInputStream(stream);
+                                ZipArchiveInputStream zis = new ZipArchiveInputStream(stream);
 
                                 scanZipArchive(dataFileWriter, child.getAbsolutePath(), zis, outputPath, splitSize);
                             }
@@ -153,32 +157,28 @@ public class CopyToAvro {
         }
     }
 
-    private static DataFileWriter<Document> scanZipArchive(DataFileWriter<Document> dataFileWriter, String parentPath, ZipInputStream zis, String outputPath, long splitSize) throws IOException {
+    private static DataFileWriter<Document> scanZipArchive(DataFileWriter<Document> dataFileWriter, String parentPath, ZipArchiveInputStream zis, String outputPath, long splitSize) throws IOException {
 
 
         System.out.println("Scan zip file: "+parentPath);
         try {
-            ZipEntry entry;
+            ArchiveEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 if (!entry.isDirectory()) {
 
                     String entryPath = parentPath + "/" + entry.getName();
 
-                    try {
-                        if ("zip".equalsIgnoreCase(FilenameUtils.getExtension(entry.getName()))) {
-                            ZipInputStream subZis = new ZipInputStream(zis);
-                            dataFileWriter = scanZipArchive(dataFileWriter, entryPath, subZis, outputPath, splitSize);
-                        } else {
-                            Document document = toDocument(entryPath, zis);
-                            dataFileWriter.append(document);
-                            if (dataFileWriter.sync() >= splitSize) {
-                                dataFileWriter.close();
-                                cptFile++;
-                                dataFileWriter = createAvroDocumentFile(outputPath + "/result" + String.format("%03d", cptFile) + ".avro");
-                            }
+                    if ("zip".equalsIgnoreCase(FilenameUtils.getExtension(entry.getName()))) {
+                        ZipArchiveInputStream subZis = new ZipArchiveInputStream(zis);
+                        dataFileWriter = scanZipArchive(dataFileWriter, entryPath, subZis, outputPath, splitSize);
+                    } else {
+                        Document document = toDocument(entryPath, zis);
+                        dataFileWriter.append(document);
+                        if (dataFileWriter.sync() >= splitSize) {
+                            dataFileWriter.close();
+                            cptFile++;
+                            dataFileWriter = createAvroDocumentFile(outputPath + "/result" + String.format("%03d", cptFile) + ".avro");
                         }
-                    }finally {
-                        zis.closeEntry();
                     }
                 }
             }
@@ -214,6 +214,7 @@ public class CopyToAvro {
         doc.setLang("");
         ByteArrayOutputStream ous = new ByteArrayOutputStream();
         IOUtils.copy(stream, ous);
+        doc.setBody(ByteBuffer.wrap(ous.toByteArray()));
 
         return doc;
     }
