@@ -160,7 +160,7 @@ public class CopyToAvro {
     private static DataFileWriter<Document> scanZipArchive(DataFileWriter<Document> dataFileWriter, String parentPath, ZipArchiveInputStream zis, String outputPath, long splitSize) throws IOException {
 
 
-        System.out.println("Scan zip file: "+parentPath);
+        log.debug("Scan zip file: "+parentPath);
         try {
             ArchiveEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
