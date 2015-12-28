@@ -1,0 +1,18 @@
+{
+  "type" : "record",
+  "name" : "Document",
+  "namespace" : "org.grozeille.avro",
+  "fields" : [ {
+    "name" : "path",
+    "type" : "string"
+  }, {
+    "name" : "lang",
+    "type" : "string"
+  }, {
+    "name" : "body",
+    "type" : {
+      "type" : "bytes",
+      "java-class" : "[B"
+    }
+  } ]
+}
