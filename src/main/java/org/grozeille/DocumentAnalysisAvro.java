@@ -9,42 +9,28 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDResources;
+import org.apache.pdfbox.pdmodel.encryption.StandardDecryptionMaterial;
 import org.apache.pdfbox.pdmodel.graphics.xobject.PDXObject;
 import org.apache.pdfbox.pdmodel.graphics.xobject.PDXObjectImage;
-import org.apache.pdfbox.util.ImageIOUtil;
+import org.apache.pdfbox.util.PDFTextStripper;
 import org.apache.spark.Accumulator;
 import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.JavaPairRDD;
-import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.api.java.function.Function;
-import org.apache.spark.input.PortableDataStream;
+import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.sql.DataFrame;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SQLContext;
+import org.apache.spark.sql.api.java.UDF2;
 import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
 import org.apache.tika.Tika;
 import org.apache.tika.exception.TikaException;
-import org.apache.tika.language.LanguageIdentifier;
 import org.bytedeco.javacpp.BytePointer;
-import org.grozeille.avro.Document;
 
 import javax.imageio.ImageIO;
-import javax.imageio.ImageReader;
-import javax.imageio.stream.ImageInputStream;
 import java.awt.image.BufferedImage;
 import java.io.*;
-import java.net.MalformedURLException;
-import java.nio.ByteBuffer;
-import java.util.*;
-import java.util.function.Consumer;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
+import java.util.List;
+import java.util.Map;
 
-import static org.bytedeco.javacpp.lept.*;
 import static org.bytedeco.javacpp.tesseract.TessBaseAPI;
 
 /**
@@ -53,6 +39,7 @@ import static org.bytedeco.javacpp.tesseract.TessBaseAPI;
 @Slf4j
 public class DocumentAnalysisAvro {
     public static void main(String[] args) throws Exception {
+        System.setProperty("jna.encoding", "UTF8");
 
         Option inputOption  = OptionBuilder.withArgName( "input" )
                 .isRequired()
@@ -108,18 +95,17 @@ public class DocumentAnalysisAvro {
         JavaSparkContext sc = new JavaSparkContext(sparkConf);
         SQLContext sqlContext = new SQLContext(sc);
 
-
-        DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
-
         Accumulator<Integer> documentParsedAccumulator = sc.accumulator(0);
         Accumulator<Integer> documentErrorAccumulator = sc.accumulator(0);
 
+        UDF2<String, byte[], byte[]> documentTextParserUdf = new DocumentTextParserUdf(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator);
+        sqlContext.udf().register("parseDocument", documentTextParserUdf, DataTypes.BinaryType);
 
-        JavaRDD<Row> documentRdd = inputDf.select("path", "body")
-                .toJavaRDD()
-                .map(r -> new Document((String)r.get(0), "", ByteBuffer.wrap((byte[])r.get(1))))
-                .map(new DocumentTextParser(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator)).flatMap(documents -> documents)
-                .map(d -> RowFactory.create(d.getPath(), d.getLang(), d.getBody().array()));
+        DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
+        sqlContext.registerDataFrameAsTable(inputDf, "raw");
+
+        sqlContext.sql("select path, parseDocument(path, body) as body from raw")//.coalesce(32)
+                .write().format("com.databricks.spark.avro").save(outputPath);
 
 
         /*documentRdd.foreach((VoidFunction<Document>) d -> {
@@ -131,42 +117,33 @@ public class DocumentAnalysisAvro {
             //System.out.println("------------------------------------------------------------------------");
         });*/
 
-        //DataFrame documentDF = sqlContext.createDataFrame(documentRdd, Document.class);
-        List<StructField> fields = new ArrayList<StructField>();
-        fields.add(DataTypes.createStructField("path", DataTypes.StringType, true));
-        fields.add(DataTypes.createStructField("lang", DataTypes.StringType, true));
-        //fields.add(DataTypes.createStructField("body", DataTypes.createArrayType(DataTypes.BinaryType), true));
-        fields.add(DataTypes.createStructField("body", DataTypes.BinaryType, true));
-        StructType schema = DataTypes.createStructType(fields);
-
-        DataFrame documentDF = sqlContext.createDataFrame(documentRdd, schema);
-
-        documentDF.write().format("com.databricks.spark.avro").save(outputPath);
 
         log.info("Parsed: "+documentParsedAccumulator.value());
         log.info("Error: "+documentErrorAccumulator.value());
     }
 
-    private static Collection<? extends String> scanSubfolders(String inputPath) {
-        File parent = new File(inputPath);
-        List<String> folders = new ArrayList<>();
-        String[] directories = parent.list((current, name) -> new File(current, name).isDirectory());
-        if(directories != null) {
-            for (String d : directories) {
-                try {
-                    folders.add(new File(parent, d).toURI().toURL().toString());
-                } catch (MalformedURLException e) {
-                    log.error("Unable to add folder: "+d, e);
-                }
-                folders.addAll(scanSubfolders(new File(parent, d).getAbsolutePath()));
+    @RequiredArgsConstructor
+    private static class DocumentTextParserUdf implements UDF2<String, byte[], byte[]> {
+
+        private transient DocumentTextParser documentTextParser;
+
+        private final String tesseractPath;
+        private final String tesseractLang;
+        private final Accumulator<Integer> documentParsedAccumulator;
+        private final Accumulator<Integer> documentErrorAccumulator;
+
+        @Override
+        public byte[] call(String path, byte[] body) throws Exception {
+            if(documentTextParser == null){
+                documentTextParser = new DocumentTextParser(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator);
             }
+            return documentTextParser.call(path, body);
         }
-        return folders;
     }
 
     @RequiredArgsConstructor
     @Slf4j
-    private static class DocumentTextParser implements Function<Document, List<Document>>, Closeable {
+    private static class DocumentTextParser implements Function2<String, byte[], byte[]>, Closeable {
 
         private transient Tika tika;
         private transient TessBaseAPI tessBaseAPI;
@@ -178,7 +155,7 @@ public class DocumentAnalysisAvro {
         private final Accumulator<Integer> documentErrorAccumulator;
 
         @Override
-        public List<Document> call(Document inputDoc) throws Exception {
+        public byte[] call(String path, byte[] body) throws Exception {
 
             if(tika == null) {
                 tika = new Tika();
@@ -194,43 +171,12 @@ public class DocumentAnalysisAvro {
                 }
             }
 
-            String path = inputDoc.getPath().toString();
-            String extension = FilenameUtils.getExtension(path);
-
-
-            if("zip".equalsIgnoreCase(extension)){
-
-                List<Document> documents = new ArrayList<>();
-
-                try(ByteArrayInputStream stream = new ByteArrayInputStream(inputDoc.getBody().array())) {
-                    ZipInputStream zis = new ZipInputStream(stream);
-
-                    try {
-                        ZipEntry entry;
-                        while ((entry = zis.getNextEntry()) != null) {
-                            if (!entry.isDirectory()) {
-                                String entryPath = path + "/" + entry.getName();
-                                documents.add(parseDocument(zis, entryPath));
-                            }
-                        }
-                    }
-                    catch (Exception ex){
-                        log.error("Unable to read zip file "+path, ex);
-                    }
-
-                    return documents;
-                }
+            try(ByteArrayInputStream stream = new ByteArrayInputStream(body)) {
+                return parseDocument(path, stream);
             }
-            else {
-                try(ByteArrayInputStream stream = new ByteArrayInputStream(inputDoc.getBody().array())) {
-                    return Arrays.asList(parseDocument(stream, path));
-                }
-            }
-
-
         }
 
-        private Document parseDocument(InputStream inputStream, String path) throws IOException, TikaException {
+        private byte[] parseDocument(String path, InputStream inputStream) throws IOException, TikaException {
 
             log.info("Parsing file: "+path);
 
@@ -244,6 +190,9 @@ public class DocumentAnalysisAvro {
             IOUtils.closeQuietly(out);
             byte[] bytes = out.toByteArray();
 
+            // add path to text
+            outputText.append(path.replace('.', ' ').replace('/', ' ').replace('\\', ' ').replace('_', ' ')).append("\n");
+
             // parse document
             try(ByteArrayInputStream stream = new ByteArrayInputStream(bytes)) {
 
@@ -256,56 +205,87 @@ public class DocumentAnalysisAvro {
             }
 
             // special case for PDF: parse images inside (ocr)
-            /*if("pdf".equalsIgnoreCase(extension) && tessInitialized){
+            if("pdf".equalsIgnoreCase(extension) && tessInitialized){
 
-                try(ByteArrayInputStream stream = new ByteArrayInputStream(bytes)) {
+                try {
 
-                    // load all pages of the PDF and search for images
-                    try (PDDocument document = PDDocument.load(stream)) {
+                    try(ByteArrayInputStream stream = new ByteArrayInputStream(bytes)) {
 
-                        // try to decrypt
-                        if(document.isEncrypted()) {
-                            try {
-                                StandardDecryptionMaterial sdm = new StandardDecryptionMaterial("");
-                                document.openProtection(sdm);
-                                document.decrypt("");
-                                document.setAllSecurityToBeRemoved(true);
-                                log.info("Successfully decrypted PDF: " + path);
+                        // load all pages of the PDF and search for images
+                        try (PDDocument document = PDDocument.load(stream)) {
+
+                            if(document.isEncrypted()) {
+                                try {
+
+                                    // try to decrypt
+                                    StandardDecryptionMaterial sdm = new StandardDecryptionMaterial("");
+                                    document.openProtection(sdm);
+                                    document.decrypt("");
+                                    document.setAllSecurityToBeRemoved(true);
+                                    log.info("Successfully decrypted PDF: " + path);
+
+                                    // if decrypted, parse the text
+                                    try {
+                                        PDFTextStripper stripper = new PDFTextStripper();
+                                        outputText.append(stripper.getText(document)).append("\n");
+                                    }catch(Exception ex){
+                                        log.error("Unable to parse decrypted PDF: "+path.toString(), ex);
+                                    }
+
+                                    // then scan images
+                                    outputText.append(parsePdfImages(path, document)).append("\n");
+
+                                } catch (Exception ex) {
+                                    log.warn("Unable to decrypt PDF: " + path.toString());
+                                    documentErrorAccumulator.add(1);
+                                }
+                            }
+                            else {
+
+                                // tika should have parsed the text if decrypted PDF, now try to scan images
 
                                 outputText.append(parsePdfImages(path, document)).append("\n");
-                            } catch (Exception ex) {
-                                log.warn("Unable to decrypt PDF: " + path.toString());
-                                documentErrorAccumulator.add(1);
 
-                                outputText.append(parsePdfEncrypted(path, document)).append("\n");
                             }
-                        }
-                        else {
-                            outputText.append(parsePdfImages(path, document)).append("\n");
+
+                            // in any cases, try to do OCR on PDF to retrieve additional information
+                            try {
+                                outputText.append(parsePdfOcr(path, document)).append("\n");
+                            }catch(Exception ex){
+                                log.error("Unable to do ocr on PDF: "+path.toString(), ex);
+                            }
                         }
                     }
                 }
-            }*/
+                catch (Exception ex){
+                    log.error("Unable to parse PDF document", ex);
+                }
+            }
 
 
             String text = outputText.toString();
-            LanguageIdentifier identifier = new LanguageIdentifier(text);
-            lang = identifier.getLanguage();
+            //LanguageIdentifier identifier = new LanguageIdentifier(text);
+            //lang = identifier.getLanguage();
 
             documentParsedAccumulator.add(1);
-            return new Document(path, lang, ByteBuffer.wrap(text.getBytes()));
+            return text.getBytes();
         }
 
-        private String parsePdfEncrypted(String path, PDDocument document) throws IOException {
+        private String parsePdfOcr(String path, PDDocument document) throws IOException {
             List<PDPage> list = document.getDocumentCatalog().getAllPages();
             StringBuilder outputText = new StringBuilder();
+            int pageCpt = 0;
             for (PDPage page : list) {
 
+                log.info("parsing page "+pageCpt+" from file "+path);
                 BufferedImage pageImg = page.convertToImage();
-                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-                ImageIO.write(pageImg, "tiff", outputStream);
 
-                outputText.append(ocr(path, outputStream.toByteArray())).append("\n");
+                try {
+                    outputText.append(ocr(pageImg)).append("\n");
+                } catch (Exception ex) {
+                    log.error("unable to do ocr on page "+pageCpt+" for file: " + path, ex);
+                }
+                pageCpt++;
             }
 
             return outputText.toString();
@@ -325,9 +305,10 @@ public class DocumentAnalysisAvro {
 
                             try {
                                 PDXObjectImage pdxObjectImage = (PDXObjectImage) e.getValue();
-                                outputText.append(ocr(path, pdxObjectImage)).append("\n");
+                                log.info("parsing image "+e.getKey()+" from file "+path);
+                                outputText.append(ocr(pdxObjectImage)).append("\n");
                             } catch (Exception ex) {
-                                log.error("unable to do ocr on image for file: " + path, ex);
+                                log.error("unable to do ocr on image "+e.getKey()+" for file: " + path, ex);
                             }
                         }
                     }
@@ -337,62 +318,38 @@ public class DocumentAnalysisAvro {
             return outputText.toString();
         }
 
-        private String ocr(String path, PDXObjectImage pdxObjectImage){
+        private String ocr(PDXObjectImage pdxObjectImage) throws IOException {
 
-            byte[] imageByteArray = null;
+            // read the image
+            ByteArrayOutputStream imageOutputStream = new ByteArrayOutputStream();
+            pdxObjectImage.write2OutputStream(imageOutputStream);
+            imageOutputStream.close();
+            byte[] imageByteArray = imageOutputStream.toByteArray();
+            BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageByteArray));
 
-            try {
-                // read the image
-                ByteArrayOutputStream imageOutputStream = new ByteArrayOutputStream();
-                pdxObjectImage.write2OutputStream(imageOutputStream);
-                imageOutputStream.close();
-                imageByteArray = imageOutputStream.toByteArray();
-            } catch (Exception ex){
-                log.error("Unable to extract image from pdf : "+path, ex);
-                return "";
-            }
-
-            try {
-                // convert PNG to BMP because of an issue on Windows with Leptonica
-                ImageInputStream iis = ImageIO.createImageInputStream(new ByteArrayInputStream(imageByteArray));
-                Iterator<ImageReader> imageReaders = ImageIO.getImageReaders(iis);
-                String format = "";
-                if(imageReaders.hasNext()){
-                    format = imageReaders.next().getFormatName();
-                }
-
-                if("png".equalsIgnoreCase(format) || "jpg".equalsIgnoreCase(format)  || "jpeg".equalsIgnoreCase(format)  || "gif".equalsIgnoreCase(format)){
-                    BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageByteArray));
-                    ByteArrayOutputStream imageOutputStream = new ByteArrayOutputStream();
-                    ImageIOUtil.writeImage(image, "tiff", imageOutputStream);
-                    imageByteArray = imageOutputStream.toByteArray();
-                }
-            } catch (Exception ex){
-                log.error("Unable to convert image from pdf : "+path, ex);
-                return "";
-            }
-
-            return ocr(path, imageByteArray);
+            return ocr(image);
         }
 
-        private String ocr(String path, byte[] imageByteArray) {
+        private String ocr(BufferedImage image) throws IOException {
+
+            // convert to tiff
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            ImageIO.write(image, "tiff", outputStream);
+            outputStream.close();
+            byte[] imageByteArray = outputStream.toByteArray();
+
 
             BytePointer outText = null;
+            int bpp = image.getColorModel().getPixelSize();
+            int bytespp = bpp / 8;
+            int bytespl = (int) Math.ceil(image.getWidth() * bpp / 8.0);
 
             try{
                 // do OCR
-                PIX image = pixReadMem(imageByteArray, imageByteArray.length);
-                if(image == null){
-                    log.error("Could not read image.");
-                    return "";
-                }
-                else {
-                    tessBaseAPI.SetImage(image);
-                    outText = tessBaseAPI.GetUTF8Text();
-                    pixDestroy(image);
+                tessBaseAPI.SetImage(imageByteArray, image.getWidth(), image.getHeight(), bytespp, bytespl);
+                outText = tessBaseAPI.GetUTF8Text();
 
-                    return outText == null ? "" : outText.getString();
-                }
+                return outText == null ? "" : outText.getString();
             }finally {
                 if(outText != null) {
                     outText.deallocate();

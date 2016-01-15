@@ -137,7 +137,7 @@ public class CopyToAvro {
                             try (InputStream stream = new FileInputStream(child)) {
                                 ZipArchiveInputStream zis = new ZipArchiveInputStream(stream);
 
-                                scanZipArchive(dataFileWriter, child.getAbsolutePath(), zis, outputPath, splitSize);
+                                dataFileWriter = scanZipArchive(dataFileWriter, child.getAbsolutePath(), zis, outputPath, splitSize);
                             }
                         } else {
                             Document document = toDocument(child);
