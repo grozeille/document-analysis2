@@ -2,6 +2,7 @@ package org.grozeille;
 
 import com.lucidworks.spark.SolrSupport;
 import org.apache.commons.cli.*;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.solr.common.SolrDocument;
 import org.apache.solr.common.SolrInputDocument;
 import org.apache.solr.common.SolrInputField;
@@ -13,8 +14,13 @@ import org.apache.spark.api.java.function.Function;
 import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SQLContext;
+import org.apache.spark.sql.api.java.UDF1;
 import org.apache.spark.sql.api.java.UDF2;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.tika.language.LanguageIdentifier;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 
 public class IndexToSolr {
 
@@ -25,6 +31,10 @@ public class IndexToSolr {
                 .hasArgs()
                 .withDescription( "Input path to analyse." )
                 .create( "i" );
+        Option langOption  = OptionBuilder.withArgName( "lang" )
+                .hasArgs()
+                .withDescription( "Input path of lang." )
+                .create( "l" );
         Option outputOption  = OptionBuilder.withArgName( "zkhost" )
                 .isRequired()
                 .hasArgs()
@@ -39,6 +49,7 @@ public class IndexToSolr {
 
         Options options = new Options();
         options.addOption(inputOption);
+        options.addOption(langOption);
         options.addOption(outputOption);
         options.addOption(collectionOption);
 
@@ -60,6 +71,7 @@ public class IndexToSolr {
 
 
         String inputPath = line.getOptionValue("i");
+        String langPath = line.getOptionValue("l");
         String zkHost = line.getOptionValue("z", "localhost:2181");
         String collection = line.getOptionValue("c", "ineodoc");
         int batchSize = 100;
@@ -72,11 +84,32 @@ public class IndexToSolr {
 
         try {
             DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
+            if(langPath != null) {
+                DataFrame langDf = sqlContext.read().format("com.databricks.spark.avro").load(langPath);
+                inputDf = inputDf.join(langDf, inputDf.col("path").equalTo(langDf.col("path"))).select(inputDf.col("path"), inputDf.col("fileName"), langDf.col("lang"), inputDf.col("body"));
+            }
 
             JavaRDD<SolrInputDocument> docs = inputDf.toJavaRDD().map((Function<Row, SolrInputDocument>) row -> {
+
+                String path = row.getAs("path");
+                String id = DigestUtils.sha256Hex(path);
+
+                String body = row.getAs("body");
+                String fileName = row.getAs("fileName");
+                String lang = row.getAs("lang");
+
                 SolrInputDocument doc = new SolrInputDocument();
-                doc.setField("id", row.getString(0));
-                doc.setField("text", new String((byte[]) row.get(2), "UTF-8"));
+                doc.setField("id", id);
+                doc.setField("path", path);
+                doc.setField("fileName", fileName);
+                doc.setField("lang", lang);
+                doc.setField("text", body);
+                if("fr".equalsIgnoreCase(lang)){
+                    doc.setField("text_fr", body);
+                }
+                else if("en".equalsIgnoreCase(lang)){
+                    doc.setField("text_en", body);
+                }
 
                 return doc;
             });

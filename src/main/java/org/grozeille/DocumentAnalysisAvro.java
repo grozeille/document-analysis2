@@ -3,31 +3,42 @@ package org.grozeille;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.cli.*;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.encryption.StandardDecryptionMaterial;
 import org.apache.pdfbox.pdmodel.graphics.xobject.PDXObject;
 import org.apache.pdfbox.pdmodel.graphics.xobject.PDXObjectImage;
 import org.apache.pdfbox.util.PDFTextStripper;
+import org.apache.poi.POIXMLProperties;
+import org.apache.poi.hpsf.Property;
+import org.apache.poi.hpsf.PropertySetFactory;
+import org.apache.poi.hpsf.SummaryInformation;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.apache.spark.Accumulator;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.SQLContext;
+import org.apache.spark.sql.api.java.UDF1;
 import org.apache.spark.sql.api.java.UDF2;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.tika.Tika;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.language.LanguageIdentifier;
+import org.apache.tika.metadata.Metadata;
 import org.bytedeco.javacpp.BytePointer;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
@@ -89,7 +100,7 @@ public class DocumentAnalysisAvro {
         String outputPath = line.getOptionValue("o");
         String tesseractPath = line.getOptionValue("t");
         String tesseractLang = line.getOptionValue("l", "fra");
-        Boolean withOcr = Boolean.valueOf(line.getOptionValue("c", "true"));
+        Boolean withOcr = Boolean.valueOf(line.getOptionValue("c", "false"));
 
 
         SparkConf sparkConf = new SparkConf().setAppName("DocumentAnalysis");
@@ -101,13 +112,27 @@ public class DocumentAnalysisAvro {
             Accumulator<Integer> documentParsedAccumulator = sc.accumulator(0);
             Accumulator<Integer> documentErrorAccumulator = sc.accumulator(0);
 
-            UDF2<String, byte[], byte[]> documentTextParserUdf = new DocumentTextParserUdf(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator, withOcr);
-            sqlContext.udf().register("parseDocument", documentTextParserUdf, DataTypes.BinaryType);
+            UDF2<String, byte[], String> extractTextUdf = new DocumentTextParserUdf(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator, withOcr);
+            sqlContext.udf().register("extractText", extractTextUdf, DataTypes.StringType);
+
+            UDF1<String, String> extractFileNameUdf = (UDF1<String, String>) s -> FilenameUtils.getName(s);
+            sqlContext.udf().register("extractFileName", extractFileNameUdf, DataTypes.StringType);
+
+            UDF1<String, String> extractExtensionUdf = (UDF1<String, String>) s -> FilenameUtils.getExtension(s);
+            sqlContext.udf().register("extractExtension", extractExtensionUdf, DataTypes.StringType);
+
+            UDF1<String, String> detectLangUdf = (UDF1<String, String>) s -> {
+
+                LanguageIdentifier identifier = new LanguageIdentifier(s);
+                return identifier.isReasonablyCertain() ? identifier.getLanguage() : "";
+            };
+            sqlContext.udf().register("detectLang", detectLangUdf, DataTypes.StringType);
 
             DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
             sqlContext.registerDataFrameAsTable(inputDf, "raw");
 
-            sqlContext.sql("select path, parseDocument(path, body) as body from raw")
+            sqlContext.sql("select R.path, R.body, R.fileName, R.extension, detectLang(R.body) as lang from (" +
+                    "select path, extractText(path, body) as body, extractFileName(path) as fileName, extractExtension(path) as extension from raw) R")
                     .write().format("com.databricks.spark.avro").save(outputPath);
 
 
@@ -119,7 +144,7 @@ public class DocumentAnalysisAvro {
     }
 
     @RequiredArgsConstructor
-    private static class DocumentTextParserUdf implements UDF2<String, byte[], byte[]> {
+    private static class DocumentTextParserUdf implements UDF2<String, byte[], String> {
 
         private transient DocumentTextParser documentTextParser;
 
@@ -130,7 +155,7 @@ public class DocumentAnalysisAvro {
         private final Boolean withOcr;
 
         @Override
-        public byte[] call(String path, byte[] body) throws Exception {
+        public String call(String path, byte[] body) throws Exception {
             if(documentTextParser == null){
                 documentTextParser = new DocumentTextParser(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator, withOcr);
             }
@@ -140,9 +165,10 @@ public class DocumentAnalysisAvro {
 
     @RequiredArgsConstructor
     @Slf4j
-    private static class DocumentTextParser implements Function2<String, byte[], byte[]>, Closeable {
+    private static class DocumentTextParser implements Function2<String, byte[], String>, Closeable {
 
         private transient Tika tika;
+        private transient Metadata metadata;
         private transient TessBaseAPI tessBaseAPI;
         private transient boolean tessInitialized = false;
 
@@ -153,10 +179,12 @@ public class DocumentAnalysisAvro {
         private final Boolean withOcr;
 
         @Override
-        public byte[] call(String path, byte[] body) throws Exception {
+        public String call(String path, byte[] body) throws Exception {
 
             if(tika == null) {
                 tika = new Tika();
+                metadata = new Metadata();
+                metadata.add(Metadata.CONTENT_ENCODING, "UTF-8");
             }
             if(withOcr && tessBaseAPI == null){
                 tessBaseAPI = new TessBaseAPI();
@@ -174,14 +202,13 @@ public class DocumentAnalysisAvro {
             }
         }
 
-        private byte[] parseDocument(String path, InputStream inputStream) throws IOException, TikaException {
+        private String parseDocument(String path, InputStream inputStream) throws IOException, TikaException {
 
             log.info("Parsing file: "+path);
 
             String extension = FilenameUtils.getExtension(path);
             StringBuilder outputText = new StringBuilder();
 
-            String lang;
             // not very good... but need to read it multiple times and tika is closing the stream at the end of the parsing...
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             IOUtils.copy(inputStream, out);
@@ -195,7 +222,7 @@ public class DocumentAnalysisAvro {
             try(ByteArrayInputStream stream = new ByteArrayInputStream(bytes)) {
 
                 try {
-                    String text = tika.parseToString(stream);
+                    String text = tika.parseToString(stream, metadata);
                     outputText.append(text).append("\n");
                 }catch (Exception ex){
                     log.error("Unable to parse file: "+path, ex);
@@ -211,6 +238,17 @@ public class DocumentAnalysisAvro {
 
                         // load all pages of the PDF and search for images
                         try (PDDocument document = PDDocument.load(stream)) {
+
+                            PDDocumentInformation info = document.getDocumentInformation();
+
+                            outputText.append(info.getTitle()).append("\n");
+                            outputText.append(info.getAuthor()).append("\n");
+                            outputText.append(info.getSubject()).append("\n");
+                            outputText.append(info.getKeywords()).append("\n");
+                            outputText.append(info.getCreator()).append("\n");
+                            outputText.append(info.getProducer()).append("\n");
+                            outputText.append(info.getCreationDate()).append("\n");
+                            outputText.append(info.getModificationDate()).append("\n");
 
                             if(document.isEncrypted()) {
                                 try {
@@ -264,14 +302,52 @@ public class DocumentAnalysisAvro {
                     log.error("Unable to parse PDF document", ex);
                 }
             }
+            else if("docx".equalsIgnoreCase(extension)){
+                try {
+                    try(ByteArrayInputStream stream = new ByteArrayInputStream(bytes)) {
+
+                        try (XWPFDocument  document = new XWPFDocument(stream)) {
+                            POIXMLProperties.CoreProperties props = document.getProperties().getCoreProperties();
+                            outputText.append(props.getTitle()).append("\n");
+                            outputText.append(props.getDescription()).append("\n");
+                            outputText.append(props.getCreator()).append("\n");
+                            outputText.append(props.getKeywords()).append("\n");
+                            outputText.append(props.getSubject()).append("\n");
+                        }
+                    }
+                }
+                catch (Exception ex){
+                    log.error("Unable to parse DOCX document", ex);
+                }
+            }
+            else if("doc".equalsIgnoreCase(extension)){
+                try {
+                    try(ByteArrayInputStream stream = new ByteArrayInputStream(bytes)) {
+                        SummaryInformation si = (SummaryInformation) PropertySetFactory.create(stream);
+
+                        outputText.append(si.getTitle()).append("\n");
+                        outputText.append(si.getLastAuthor()).append("\n");
+                        outputText.append(si.getAuthor()).append("\n");
+                        outputText.append(si.getKeywords()).append("\n");
+                        outputText.append(si.getComments()).append("\n");
+                        outputText.append(si.getSubject()).append("\n");
+                        for(Property p : si.getProperties()){
+                            if(p.getValue() != null) {
+                                outputText.append(p.getValue().toString()).append("\n");
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex){
+                    log.error("Unable to parse DOC document", ex);
+                }
+            }
 
 
             String text = outputText.toString();
-            //LanguageIdentifier identifier = new LanguageIdentifier(text);
-            //lang = identifier.getLanguage();
 
             documentParsedAccumulator.add(1);
-            return text.getBytes();
+            return text;
         }
 
         private String parsePdfOcr(String path, PDDocument document) throws IOException {

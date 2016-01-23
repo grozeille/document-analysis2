@@ -5,9 +5,14 @@ mvn package
 
 set RAW_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\input\03_A_ranger
 set RAW_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\input\test
+set RAW_PATH=Z:\AMINA\03_A_ranger
 set AVRO_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\avro
 set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed
 set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_simple
+set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_simple2
+set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_simple3
+set WORDCOUNT_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\wordcount
+set LANG_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\lang
 set TESSERACT_PATH=C:\Users\Mathias\Work\Tools\tessdata-master
 set TESSERACT_LANG=fra
 
@@ -17,7 +22,7 @@ set SPARK_SUBMIT_OPTS=-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,addr
 
 
 
-spark-submit --master local[8] --class org.grozeille.DocumentAnalysisAvro target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %AVRO_PATH% -o %PARSED_PATH% -t %TESSERACT_PATH%
+spark-submit --master local[8] --class org.grozeille.DocumentAnalysisAvro target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %AVRO_PATH% -o %PARSED_PATH% -t %TESSERACT_PATH% > out 2>&1
 
 
 bin\solr start -c -m 1g -z localhost:2181 -f
@@ -35,6 +40,109 @@ curl -X POST http://localhost:8983/solr/ineodoc/config -d '{"set-property":{"upd
 
 
 
+spark-submit --master local[8] --class org.grozeille.DetectLang target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %PARSED_PATH% -o %LANG_PATH%
 
-spark-submit --master local[8] --class org.grozeille.IndexToSolr target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %PARSED_PATH% -z localhost:2181 -c ineodoc
+spark-submit --master local[8] --class org.grozeille.IndexToSolr target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %PARSED_PATH% -z localhost:2181 -c ineodoc -l %LANG_PATH%
+
+
+spark-submit --master local[8] --class org.grozeille.WordCount target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %PARSED_PATH% -o %WORDCOUNT_PATH%
+
+
+
+```
+
+```SQL
+
+DROP TABLE documents;
+CREATE EXTERNAL TABLE documents (
+  path string,
+  body string,
+  fileName string,
+  lang string)
+STORED AS AVRO
+LOCATION 'C:\\Users\\Mathias\\vagrant\\hadoop\\document-analysis\\output\\parsed_simple2'
+TBLPROPERTIES (
+    'avro.schema.literal'='{
+                             "type" : "record",
+                             "name" : "topLevelRecord",
+                             "fields" : [ {
+                               "name" : "path",
+                               "type" : [ "string", "null" ]
+                             }, {
+                               "name" : "body",
+                               "type" : [ "string", "null" ]
+                             }, {
+                               "name" : "fileName",
+                               "type" : [ "string", "null" ]
+                             }, {
+                               "name" : "lang",
+                               "type" : [ "string", "null" ]
+                             } ]
+                           }')
+;
+
+DROP TABLE lang;
+CREATE EXTERNAL TABLE lang (
+  path string,
+  lang string)
+STORED AS AVRO
+LOCATION 'C:\\Users\\Mathias\\vagrant\\hadoop\\document-analysis\\output\\lang'
+TBLPROPERTIES (
+    'avro.schema.literal'='{
+                              "type" : "record",
+                              "name" : "topLevelRecord",
+                              "fields" : [ {
+                                "name" : "path",
+                                "type" : [ "string", "null" ]
+                              }, {
+                                "name" : "lang",
+                                "type" : [ "string", "null" ]
+                              } ]
+                            }')
+;
+
+DROP TABLE wordcount;
+CREATE EXTERNAL TABLE wordcount (
+  f string,
+  w string,
+  c bigint)
+STORED AS AVRO
+LOCATION 'C:\\Users\\Mathias\\vagrant\\hadoop\\document-analysis\\output\\wordcount'
+TBLPROPERTIES (
+    'avro.schema.literal'='{
+                             "type" : "record",
+                             "name" : "topLevelRecord",
+                             "fields" : [ {
+                               "name" : "f",
+                               "type" : [ "string", "null" ]
+                             }, {
+                               "name" : "w",
+                               "type" : [ "string", "null" ]
+                             }, {
+                               "name" : "c",
+                               "type" : [ "long", "null" ]
+                             } ]
+                           }')
+;
+
+DROP TABLE clusters;
+CREATE EXTERNAL TABLE clusters (
+  path string,
+  cluster bigint)
+STORED AS AVRO
+LOCATION 'C:\\Users\\Mathias\\vagrant\\hadoop\\document-analysis\\output\\clustering'
+TBLPROPERTIES (
+    'avro.schema.literal'='{
+                             "type" : "record",
+                             "name" : "topLevelRecord",
+                             "fields" : [ {
+                               "name" : "path",
+                               "type" : [ "string", "null" ]
+                             }, {
+                               "name" : "cluster",
+                               "type" : [ "int", "null" ]
+                             } ]
+                           }')
+;
+
 ```
