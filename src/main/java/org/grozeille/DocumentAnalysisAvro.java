@@ -33,9 +33,6 @@ import java.util.Map;
 
 import static org.bytedeco.javacpp.tesseract.TessBaseAPI;
 
-/**
- * Created by Mathias on 22/12/2015.
- */
 @Slf4j
 public class DocumentAnalysisAvro {
     public static void main(String[] args) throws Exception {
@@ -51,8 +48,11 @@ public class DocumentAnalysisAvro {
                 .hasArgs()
                 .withDescription( "Output path for the result of the analysis." )
                 .create( "o" );
+        Option ocrOption  = OptionBuilder.withArgName( "ocr" )
+                .hasArgs()
+                .withDescription( "OCR ? default=true" )
+                .create( "c" );
         Option tesseractPathOption  = OptionBuilder.withArgName( "tesseract-path" )
-                .isRequired()
                 .hasArgs()
                 .withDescription( "Tesseract path." )
                 .create( "t" );
@@ -66,6 +66,7 @@ public class DocumentAnalysisAvro {
         options.addOption(outputOption);
         options.addOption(tesseractPathOption);
         options.addOption(tesseractLangOption);
+        options.addOption(ocrOption);
 
         // create the parser
         CommandLineParser parser = new BasicParser();
@@ -88,38 +89,33 @@ public class DocumentAnalysisAvro {
         String outputPath = line.getOptionValue("o");
         String tesseractPath = line.getOptionValue("t");
         String tesseractLang = line.getOptionValue("l", "fra");
+        Boolean withOcr = Boolean.valueOf(line.getOptionValue("c", "true"));
 
 
         SparkConf sparkConf = new SparkConf().setAppName("DocumentAnalysis");
         sparkConf.set("mapreduce.input.fileinputformat.input.dir.recursive","false");
         JavaSparkContext sc = new JavaSparkContext(sparkConf);
-        SQLContext sqlContext = new SQLContext(sc);
+        try {
+            SQLContext sqlContext = new SQLContext(sc);
 
-        Accumulator<Integer> documentParsedAccumulator = sc.accumulator(0);
-        Accumulator<Integer> documentErrorAccumulator = sc.accumulator(0);
+            Accumulator<Integer> documentParsedAccumulator = sc.accumulator(0);
+            Accumulator<Integer> documentErrorAccumulator = sc.accumulator(0);
 
-        UDF2<String, byte[], byte[]> documentTextParserUdf = new DocumentTextParserUdf(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator);
-        sqlContext.udf().register("parseDocument", documentTextParserUdf, DataTypes.BinaryType);
+            UDF2<String, byte[], byte[]> documentTextParserUdf = new DocumentTextParserUdf(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator, withOcr);
+            sqlContext.udf().register("parseDocument", documentTextParserUdf, DataTypes.BinaryType);
 
-        DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
-        sqlContext.registerDataFrameAsTable(inputDf, "raw");
+            DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
+            sqlContext.registerDataFrameAsTable(inputDf, "raw");
 
-        sqlContext.sql("select path, parseDocument(path, body) as body from raw")//.coalesce(32)
-                .write().format("com.databricks.spark.avro").save(outputPath);
-
-
-        /*documentRdd.foreach((VoidFunction<Document>) d -> {
-            System.out.println("------------------------------------------------------------------------");
-            System.out.println("DOC : "+d.getPath());
-            System.out.println("LANG: "+d.getLang());
-            //System.out.println("");
-            //System.out.println(d.getBody());
-            //System.out.println("------------------------------------------------------------------------");
-        });*/
+            sqlContext.sql("select path, parseDocument(path, body) as body from raw")
+                    .write().format("com.databricks.spark.avro").save(outputPath);
 
 
-        log.info("Parsed: "+documentParsedAccumulator.value());
-        log.info("Error: "+documentErrorAccumulator.value());
+            log.info("Parsed: " + documentParsedAccumulator.value());
+            log.info("Error: " + documentErrorAccumulator.value());
+        }finally {
+            sc.close();
+        }
     }
 
     @RequiredArgsConstructor
@@ -131,11 +127,12 @@ public class DocumentAnalysisAvro {
         private final String tesseractLang;
         private final Accumulator<Integer> documentParsedAccumulator;
         private final Accumulator<Integer> documentErrorAccumulator;
+        private final Boolean withOcr;
 
         @Override
         public byte[] call(String path, byte[] body) throws Exception {
             if(documentTextParser == null){
-                documentTextParser = new DocumentTextParser(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator);
+                documentTextParser = new DocumentTextParser(tesseractPath, tesseractLang, documentParsedAccumulator, documentErrorAccumulator, withOcr);
             }
             return documentTextParser.call(path, body);
         }
@@ -153,6 +150,7 @@ public class DocumentAnalysisAvro {
         private final String tesseractLang;
         private final Accumulator<Integer> documentParsedAccumulator;
         private final Accumulator<Integer> documentErrorAccumulator;
+        private final Boolean withOcr;
 
         @Override
         public byte[] call(String path, byte[] body) throws Exception {
@@ -160,7 +158,7 @@ public class DocumentAnalysisAvro {
             if(tika == null) {
                 tika = new Tika();
             }
-            if(tessBaseAPI == null){
+            if(withOcr && tessBaseAPI == null){
                 tessBaseAPI = new TessBaseAPI();
 
                 if (tessBaseAPI.Init(tesseractPath, tesseractLang) != 0) {
@@ -205,7 +203,7 @@ public class DocumentAnalysisAvro {
             }
 
             // special case for PDF: parse images inside (ocr)
-            if("pdf".equalsIgnoreCase(extension) && tessInitialized){
+            if("pdf".equalsIgnoreCase(extension)){
 
                 try {
 
@@ -233,7 +231,9 @@ public class DocumentAnalysisAvro {
                                     }
 
                                     // then scan images
-                                    outputText.append(parsePdfImages(path, document)).append("\n");
+                                    if(tessInitialized) {
+                                        outputText.append(parsePdfImages(path, document)).append("\n");
+                                    }
 
                                 } catch (Exception ex) {
                                     log.warn("Unable to decrypt PDF: " + path.toString());
@@ -243,16 +243,19 @@ public class DocumentAnalysisAvro {
                             else {
 
                                 // tika should have parsed the text if decrypted PDF, now try to scan images
-
-                                outputText.append(parsePdfImages(path, document)).append("\n");
+                                if(tessInitialized) {
+                                    outputText.append(parsePdfImages(path, document)).append("\n");
+                                }
 
                             }
 
                             // in any cases, try to do OCR on PDF to retrieve additional information
-                            try {
-                                outputText.append(parsePdfOcr(path, document)).append("\n");
-                            }catch(Exception ex){
-                                log.error("Unable to do ocr on PDF: "+path.toString(), ex);
+                            if(tessInitialized) {
+                                try {
+                                    outputText.append(parsePdfOcr(path, document)).append("\n");
+                                } catch (Exception ex) {
+                                    log.error("Unable to do ocr on PDF: " + path.toString(), ex);
+                                }
                             }
                         }
                     }
