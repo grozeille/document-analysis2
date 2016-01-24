@@ -35,6 +35,10 @@ public class IndexToSolr {
                 .hasArgs()
                 .withDescription( "Input path of lang." )
                 .create( "l" );
+        Option clusterOption  = OptionBuilder.withArgName( "cluster" )
+                .hasArgs()
+                .withDescription( "Input path of clusters." )
+                .create( "k" );
         Option outputOption  = OptionBuilder.withArgName( "zkhost" )
                 .isRequired()
                 .hasArgs()
@@ -52,6 +56,7 @@ public class IndexToSolr {
         options.addOption(langOption);
         options.addOption(outputOption);
         options.addOption(collectionOption);
+        options.addOption(clusterOption);
 
         // create the parser
         CommandLineParser parser = new BasicParser();
@@ -72,6 +77,7 @@ public class IndexToSolr {
 
         String inputPath = line.getOptionValue("i");
         String langPath = line.getOptionValue("l");
+        String clusterPath = line.getOptionValue("k");
         String zkHost = line.getOptionValue("z", "localhost:2181");
         String collection = line.getOptionValue("c", "ineodoc");
         int batchSize = 100;
@@ -84,10 +90,17 @@ public class IndexToSolr {
 
         try {
             DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
+            inputDf = inputDf.selectExpr("path", "fileName", "extension", "body", "'' as lang", "-1 as cluster");
+
             if(langPath != null) {
                 DataFrame langDf = sqlContext.read().format("com.databricks.spark.avro").load(langPath);
                 inputDf = inputDf.join(langDf, inputDf.col("path").equalTo(langDf.col("path")))
-                        .select(inputDf.col("path"), inputDf.col("fileName"), langDf.col("lang"), inputDf.col("extension"), inputDf.col("body"));
+                        .select(inputDf.col("path"), inputDf.col("fileName"), langDf.col("lang"), inputDf.col("extension"), inputDf.col("body"), inputDf.col("cluster"));
+            }
+            if(clusterPath != null){
+                DataFrame clusterDf = sqlContext.read().format("com.databricks.spark.avro").load(clusterPath);
+                inputDf = inputDf.join(clusterDf, inputDf.col("path").equalTo(clusterDf.col("path")))
+                        .select(inputDf.col("path"), inputDf.col("fileName"), inputDf.col("lang"), inputDf.col("extension"), inputDf.col("body"), clusterDf.col("cluster"));
             }
 
             JavaRDD<SolrInputDocument> docs = inputDf.toJavaRDD().map((Function<Row, SolrInputDocument>) row -> {
@@ -99,6 +112,7 @@ public class IndexToSolr {
                 String fileName = row.getAs("fileName");
                 String lang = row.getAs("lang");
                 String extension = row.getAs("extension");
+                Integer cluster = row.getAs("cluster");
 
                 SolrInputDocument doc = new SolrInputDocument();
                 doc.setField("id", id);
@@ -107,6 +121,7 @@ public class IndexToSolr {
                 doc.setField("lang", lang);
                 doc.setField("text", body);
                 doc.setField("extension", extension);
+                doc.setField("cluster", cluster);
                 if("fr".equalsIgnoreCase(lang)){
                     doc.setField("text_fr", body);
                 }
