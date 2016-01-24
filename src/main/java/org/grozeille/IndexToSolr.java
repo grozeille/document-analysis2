@@ -86,7 +86,8 @@ public class IndexToSolr {
             DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
             if(langPath != null) {
                 DataFrame langDf = sqlContext.read().format("com.databricks.spark.avro").load(langPath);
-                inputDf = inputDf.join(langDf, inputDf.col("path").equalTo(langDf.col("path"))).select(inputDf.col("path"), inputDf.col("fileName"), langDf.col("lang"), inputDf.col("body"));
+                inputDf = inputDf.join(langDf, inputDf.col("path").equalTo(langDf.col("path")))
+                        .select(inputDf.col("path"), inputDf.col("fileName"), langDf.col("lang"), inputDf.col("extension"), inputDf.col("body"));
             }
 
             JavaRDD<SolrInputDocument> docs = inputDf.toJavaRDD().map((Function<Row, SolrInputDocument>) row -> {
@@ -97,6 +98,7 @@ public class IndexToSolr {
                 String body = row.getAs("body");
                 String fileName = row.getAs("fileName");
                 String lang = row.getAs("lang");
+                String extension = row.getAs("extension");
 
                 SolrInputDocument doc = new SolrInputDocument();
                 doc.setField("id", id);
@@ -104,6 +106,7 @@ public class IndexToSolr {
                 doc.setField("fileName", fileName);
                 doc.setField("lang", lang);
                 doc.setField("text", body);
+                doc.setField("extension", extension);
                 if("fr".equalsIgnoreCase(lang)){
                     doc.setField("text_fr", body);
                 }

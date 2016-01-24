@@ -1,10 +1,15 @@
 package org.grozeille;
 
 import org.apache.commons.cli.*;
+import org.apache.lucene.analysis.shingle.ShingleFilter;
+import org.apache.lucene.analysis.standard.StandardTokenizer;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function;
+import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.ml.clustering.KMeans;
 import org.apache.spark.ml.clustering.KMeansModel;
 import org.apache.spark.ml.feature.HashingTF;
@@ -20,7 +25,9 @@ import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.tika.language.LanguageIdentifier;
+import scala.Tuple2;
 
+import java.io.*;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -38,11 +45,17 @@ public class Clustering {
                 .hasArgs()
                 .withDescription( "Output path for the result of the analysis." )
                 .create( "o" );
+        Option modelOption  = OptionBuilder.withArgName( "model" )
+                .isRequired()
+                .hasArgs()
+                .withDescription( "Output path for the model of the analysis." )
+                .create( "m" );
 
 
         Options options = new Options();
         options.addOption(inputOption);
         options.addOption(outputOption);
+        options.addOption(modelOption);
 
         // create the parser
         CommandLineParser parser = new BasicParser();
@@ -63,6 +76,7 @@ public class Clustering {
 
         String inputPath = line.getOptionValue("i");
         String outputPath = line.getOptionValue("o");
+        String modelPath = line.getOptionValue("m");
 
 
         SparkConf sparkConf = new SparkConf().setAppName("Clustering");
@@ -72,26 +86,11 @@ public class Clustering {
         try {
             DataFrame inputDf = sqlContext.read().format("com.databricks.spark.avro").load(inputPath);
 
-            JavaRDD<Row> inputRdd = inputDf.toJavaRDD().map(new Function<Row, Row>() {
-                @Override
-                public Row call(Row row) throws Exception {
-                    String id = row.getString(0);
-                    String text = new String((byte[]) row.get(2), "UTF-8");
-                    return RowFactory.create(id, text);
-                }
-            });
+            //Tokenizer tokenizer = new Tokenizer().setInputCol("body").setOutputCol("words");
+            //DataFrame wordsData = tokenizer.transform(df);
 
-            // The schema is encoded in a string
-            List<StructField> fields = new ArrayList<>();
-            fields.add(DataTypes.createStructField("path", DataTypes.StringType, true));
-            fields.add(DataTypes.createStructField("body", DataTypes.StringType, true));
-            StructType schema = DataTypes.createStructType(fields);
+            DataFrame wordsData = tokenize(inputDf);
 
-            // Apply the schema to the RDD.
-            DataFrame df = sqlContext.createDataFrame(inputRdd, schema);
-
-            Tokenizer tokenizer = new Tokenizer().setInputCol("body").setOutputCol("words");
-            DataFrame wordsData = tokenizer.transform(df);
             int numFeatures = 20;
             HashingTF hashingTF = new HashingTF()
                     .setInputCol("words")
@@ -115,6 +114,12 @@ public class Clustering {
                     .setPredictionCol("prediction");
             KMeansModel model = kmeans.fit(rescaledData);
 
+            // save model
+            File modelFile =  new File(new File(modelPath), "kmeans.ser");
+            try(ObjectOutputStream oos =  new ObjectOutputStream(new FileOutputStream(modelFile))) {
+                oos.writeObject(model);
+            }
+
             // Shows the result
             Vector[] centers = model.clusterCenters();
             System.out.println("Cluster Centers: ");
@@ -125,27 +130,85 @@ public class Clustering {
             JavaRDD<Row> fileClassified = rescaledData.select("features", "path").toJavaRDD().map(new Function<Row, Row>() {
                 @Override
                 public Row call(Row row) throws Exception {
-                    Vector features = row.getAs(0);
-                    String path = row.getAs(1);
+                    Vector features = row.getAs("features");
+                    String path = row.getAs("path");
                     Integer cluster = model.predict(features);
 
                     return RowFactory.create(path, cluster);
                 }
             });
 
-            // The schema is encoded in a string
-            fields = new ArrayList<>();
+            List<StructField> fields = new ArrayList<>();
             fields.add(DataTypes.createStructField("path", DataTypes.StringType, true));
             fields.add(DataTypes.createStructField("cluster", DataTypes.IntegerType, true));
-            schema = DataTypes.createStructType(fields);
-
-            // Apply the schema to the RDD.
-            df = sqlContext.createDataFrame(fileClassified, schema);
+            StructType schema = DataTypes.createStructType(fields);
+            DataFrame df = sqlContext.createDataFrame(fileClassified, schema);
 
             df.write().format("com.databricks.spark.avro").save(outputPath);
 
         }finally {
             sc.close();
         }
+    }
+
+    static private DataFrame tokenize(DataFrame inputDf){
+        JavaRDD<Row> ngrams = inputDf.toJavaRDD().map(new Function<Row, Row>() {
+            @Override
+            public Row call(Row row) throws Exception {
+                String id = row.getAs("path");
+                String text = row.getAs("body");
+                Reader reader = new StringReader(text);
+
+                List<String> result = new ArrayList<>();
+
+                StandardTokenizer standardTokenizer = new StandardTokenizer();
+                standardTokenizer.setReader(reader);
+                final CharTermAttribute standardCharTermAttribute = standardTokenizer.addAttribute(CharTermAttribute.class);
+
+                standardTokenizer.reset();
+                while(standardTokenizer.incrementToken()){
+                    result.add(standardCharTermAttribute.toString());
+                }
+
+
+                standardTokenizer = new StandardTokenizer();
+                standardTokenizer.setReader(reader);
+                final ShingleFilter tokenizer = new ShingleFilter(standardTokenizer, 3);
+                final CharTermAttribute charTermAttribute = tokenizer.addAttribute(CharTermAttribute.class);
+
+                tokenizer.reset();
+                while(tokenizer.incrementToken()){
+                    result.add(charTermAttribute.toString());
+                }
+
+
+                return RowFactory.create(id, result.toArray(new String[0]));
+
+                    /*
+                    return () -> new Iterator<Tuple2<String, String>>() {
+                        @Override
+                        public boolean hasNext() {
+                            try {
+                                return tokenizer.incrementToken();
+                            } catch (IOException e) {
+                                return false;
+                            }
+                        }
+
+                        @Override
+                        public Tuple2<String, String> next() {
+                            return new Tuple2<>(id, charTermAttribute.toString());
+                        }
+                    };*/
+            }
+        });
+
+        List<StructField> fields;
+        fields = new ArrayList<>();
+        fields.add(DataTypes.createStructField("path", DataTypes.StringType, true));
+        fields.add(DataTypes.createStructField("words", DataTypes.createArrayType(DataTypes.StringType), true));
+        StructType schema = DataTypes.createStructType(fields);
+
+        return inputDf.sqlContext().createDataFrame(ngrams, schema);
     }
 }

@@ -12,6 +12,8 @@ set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_
 set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_simple2
 set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_simple3
 set WORDCOUNT_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\wordcount
+set CLUSTERING_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\clustering
+set CLUSTERING_MODEL_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\
 set LANG_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\lang
 set TESSERACT_PATH=C:\Users\Mathias\Work\Tools\tessdata-master
 set TESSERACT_LANG=fra
@@ -46,6 +48,8 @@ spark-submit --master local[8] --class org.grozeille.IndexToSolr target\scala-2.
 
 
 spark-submit --master local[8] --class org.grozeille.WordCount target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %PARSED_PATH% -o %WORDCOUNT_PATH%
+
+spark-submit --master local[8] --class org.grozeille.Clustering target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %PARSED_PATH% -o %CLUSTERING_PATH% -m %CLUSTERING_MODEL_PATH%
 
 
 
