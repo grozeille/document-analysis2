@@ -3,17 +3,11 @@ package org.grozeille;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.cli.*;
-import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.lang.StringUtils;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
-import org.apache.pdfbox.pdmodel.PDPage;
-import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.encryption.StandardDecryptionMaterial;
-import org.apache.pdfbox.pdmodel.graphics.xobject.PDXObject;
-import org.apache.pdfbox.pdmodel.graphics.xobject.PDXObjectImage;
 import org.apache.pdfbox.util.PDFTextStripper;
 import org.apache.poi.POIXMLProperties;
 import org.apache.poi.hpsf.Property;
@@ -33,14 +27,9 @@ import org.apache.tika.Tika;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.language.LanguageIdentifier;
 import org.apache.tika.metadata.Metadata;
-import org.bytedeco.javacpp.BytePointer;
 
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
 import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.util.List;
-import java.util.Map;
+import java.text.SimpleDateFormat;
 
 import static org.bytedeco.javacpp.tesseract.TessBaseAPI;
 
@@ -60,8 +49,7 @@ public class DocumentAnalysisAvro {
                 .withDescription( "Output path for the result of the analysis." )
                 .create( "o" );
         Option ocrOption  = OptionBuilder.withArgName( "ocr" )
-                .hasArgs()
-                .withDescription( "OCR ? default=true" )
+                .withDescription( "OCR ?" )
                 .create( "c" );
         Option tesseractPathOption  = OptionBuilder.withArgName( "tesseract-path" )
                 .hasArgs()
@@ -100,7 +88,7 @@ public class DocumentAnalysisAvro {
         String outputPath = line.getOptionValue("o");
         String tesseractPath = line.getOptionValue("t");
         String tesseractLang = line.getOptionValue("l", "fra");
-        Boolean withOcr = Boolean.valueOf(line.getOptionValue("c", "false"));
+        Boolean withOcr = line.hasOption("c");
 
 
         SparkConf sparkConf = new SparkConf().setAppName("DocumentAnalysis");
@@ -169,14 +157,20 @@ public class DocumentAnalysisAvro {
 
         private transient Tika tika;
         private transient Metadata metadata;
-        private transient TessBaseAPI tessBaseAPI;
-        private transient boolean tessInitialized = false;
 
-        private final String tesseractPath;
-        private final String tesseractLang;
+        private final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+        private final PdfOcrUtil pdfOcrUtil;
         private final Accumulator<Integer> documentParsedAccumulator;
         private final Accumulator<Integer> documentErrorAccumulator;
         private final Boolean withOcr;
+
+        public DocumentTextParser(String tesseractPath, String tesseractLang, Accumulator<Integer> documentParsedAccumulator, Accumulator<Integer> documentErrorAccumulator, Boolean withOcr){
+
+            this.pdfOcrUtil = new PdfOcrUtil(tesseractPath, tesseractLang);
+            this.withOcr = withOcr;
+            this.documentParsedAccumulator = documentParsedAccumulator;
+            this.documentErrorAccumulator = documentErrorAccumulator;
+        }
 
         @Override
         public String call(String path, byte[] body) throws Exception {
@@ -186,15 +180,8 @@ public class DocumentAnalysisAvro {
                 metadata = new Metadata();
                 metadata.add(Metadata.CONTENT_ENCODING, "UTF-8");
             }
-            if(withOcr && tessBaseAPI == null){
-                tessBaseAPI = new TessBaseAPI();
-
-                if (tessBaseAPI.Init(tesseractPath, tesseractLang) != 0) {
-                    log.error("Could not initialize tesseract.");
-                }
-                else {
-                    tessInitialized = true;
-                }
+            if(withOcr && !this.pdfOcrUtil.isTessInitialized()){
+                this.pdfOcrUtil.init();
             }
 
             try(ByteArrayInputStream stream = new ByteArrayInputStream(body)) {
@@ -216,7 +203,7 @@ public class DocumentAnalysisAvro {
             byte[] bytes = out.toByteArray();
 
             // add path to text
-            outputText.append(path.replace('.', ' ').replace('/', ' ').replace('\\', ' ').replace('_', ' ')).append("\n");
+            //outputText.append(path.replace('.', ' ').replace('/', ' ').replace('\\', ' ').replace('_', ' ')).append("\n");
 
             // parse document
             try(ByteArrayInputStream stream = new ByteArrayInputStream(bytes)) {
@@ -247,8 +234,8 @@ public class DocumentAnalysisAvro {
                             outputText.append(info.getKeywords()).append("\n");
                             outputText.append(info.getCreator()).append("\n");
                             outputText.append(info.getProducer()).append("\n");
-                            outputText.append(info.getCreationDate()).append("\n");
-                            outputText.append(info.getModificationDate()).append("\n");
+                            outputText.append(info.getCreationDate() != null ? dateFormat.format(info.getCreationDate().getTime()) : "").append("\n");
+                            outputText.append(info.getModificationDate() != null ? dateFormat.format(info.getModificationDate().getTime()) : "").append("\n");
 
                             if(document.isEncrypted()) {
                                 try {
@@ -269,8 +256,8 @@ public class DocumentAnalysisAvro {
                                     }
 
                                     // then scan images
-                                    if(tessInitialized) {
-                                        outputText.append(parsePdfImages(path, document)).append("\n");
+                                    if(withOcr) {
+                                        outputText.append(this.pdfOcrUtil.parsePdfImages(path, document)).append("\n");
                                     }
 
                                 } catch (Exception ex) {
@@ -281,19 +268,10 @@ public class DocumentAnalysisAvro {
                             else {
 
                                 // tika should have parsed the text if decrypted PDF, now try to scan images
-                                if(tessInitialized) {
-                                    outputText.append(parsePdfImages(path, document)).append("\n");
+                                if(withOcr) {
+                                    outputText.append(this.pdfOcrUtil.parsePdfImages(path, document)).append("\n");
                                 }
 
-                            }
-
-                            // in any cases, try to do OCR on PDF to retrieve additional information
-                            if(tessInitialized) {
-                                try {
-                                    outputText.append(parsePdfOcr(path, document)).append("\n");
-                                } catch (Exception ex) {
-                                    log.error("Unable to do ocr on PDF: " + path.toString(), ex);
-                                }
                             }
                         }
                     }
@@ -331,11 +309,11 @@ public class DocumentAnalysisAvro {
                         outputText.append(si.getKeywords()).append("\n");
                         outputText.append(si.getComments()).append("\n");
                         outputText.append(si.getSubject()).append("\n");
-                        for(Property p : si.getProperties()){
+                        /*for(Property p : si.getProperties()){
                             if(p.getValue() != null) {
                                 outputText.append(p.getValue().toString()).append("\n");
                             }
-                        }
+                        }*/
                     }
                 }
                 catch (Exception ex){
@@ -350,95 +328,9 @@ public class DocumentAnalysisAvro {
             return text;
         }
 
-        private String parsePdfOcr(String path, PDDocument document) throws IOException {
-            List<PDPage> list = document.getDocumentCatalog().getAllPages();
-            StringBuilder outputText = new StringBuilder();
-            int pageCpt = 0;
-            for (PDPage page : list) {
-
-                log.info("parsing page "+pageCpt+" from file "+path);
-                BufferedImage pageImg = page.convertToImage();
-
-                try {
-                    outputText.append(ocr(pageImg)).append("\n");
-                } catch (Exception ex) {
-                    log.error("unable to do ocr on page "+pageCpt+" for file: " + path, ex);
-                }
-                pageCpt++;
-            }
-
-            return outputText.toString();
-        }
-
-        private String parsePdfImages(String path, PDDocument document){
-            List<PDPage> list = document.getDocumentCatalog().getAllPages();
-            StringBuilder outputText = new StringBuilder();
-            for (PDPage page : list) {
-                PDResources pdResources = page.getResources();
-
-                Map<String, PDXObject> pageImages = pdResources.getXObjects();
-                if (pageImages != null) {
-
-                    for (Map.Entry<String, PDXObject> e : pageImages.entrySet()) {
-                        if (e.getValue() instanceof PDXObjectImage) {
-
-                            try {
-                                PDXObjectImage pdxObjectImage = (PDXObjectImage) e.getValue();
-                                log.info("parsing image "+e.getKey()+" from file "+path);
-                                outputText.append(ocr(pdxObjectImage)).append("\n");
-                            } catch (Exception ex) {
-                                log.error("unable to do ocr on image "+e.getKey()+" for file: " + path, ex);
-                            }
-                        }
-                    }
-                }
-            }
-
-            return outputText.toString();
-        }
-
-        private String ocr(PDXObjectImage pdxObjectImage) throws IOException {
-
-            // read the image
-            ByteArrayOutputStream imageOutputStream = new ByteArrayOutputStream();
-            pdxObjectImage.write2OutputStream(imageOutputStream);
-            imageOutputStream.close();
-            byte[] imageByteArray = imageOutputStream.toByteArray();
-            BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageByteArray));
-
-            return ocr(image);
-        }
-
-        private String ocr(BufferedImage image) throws IOException {
-
-            // convert to tiff
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-            ImageIO.write(image, "tiff", outputStream);
-            outputStream.close();
-            byte[] imageByteArray = outputStream.toByteArray();
-
-
-            BytePointer outText = null;
-            int bpp = image.getColorModel().getPixelSize();
-            int bytespp = bpp / 8;
-            int bytespl = (int) Math.ceil(image.getWidth() * bpp / 8.0);
-
-            try{
-                // do OCR
-                tessBaseAPI.SetImage(imageByteArray, image.getWidth(), image.getHeight(), bytespp, bytespl);
-                outText = tessBaseAPI.GetUTF8Text();
-
-                return outText == null ? "" : outText.getString();
-            }finally {
-                if(outText != null) {
-                    outText.deallocate();
-                }
-            }
-        }
-
         @Override
         public void close() throws IOException {
-            tessBaseAPI.End();
+            this.pdfOcrUtil.close();
         }
     }
 }

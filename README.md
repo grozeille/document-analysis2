@@ -11,6 +11,7 @@ set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed
 set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_simple
 set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_simple2
 set PARSED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\parsed_simple3
+set DECRYPTED_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\decrypted
 set WORDCOUNT_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\wordcount
 set CLUSTERING_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\clustering
 set CLUSTERING_MODEL_PATH=C:\Users\Mathias\vagrant\hadoop\document-analysis\output\
@@ -26,6 +27,7 @@ set SPARK_SUBMIT_OPTS=-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,addr
 
 spark-submit --master local[8] --class org.grozeille.DocumentAnalysisAvro target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %AVRO_PATH% -o %PARSED_PATH% -t %TESSERACT_PATH% > out 2>&1
 
+spark-submit --master local[8] --class org.grozeille.DocumentAnalysisAvroEncryptedPdf target\scala-2.10\document-analysis-1.0-SNAPSHOT-hadoop2.6.0.jar -i %AVRO_PATH% -o %DECRYPTED_PATH% -t %TESSERACT_PATH%
 
 bin\solr start -c -m 1g -z localhost:2181 -f
 bin\solr create -p 8983 -c ineodoc -d basic_configs -s 1 -rf 1
