@@ -50,12 +50,18 @@ public class Clustering {
                 .hasArgs()
                 .withDescription( "Output path for the model of the analysis." )
                 .create( "m" );
+        Option clusterOption  = OptionBuilder.withArgName( "cluster" )
+                .isRequired()
+                .hasArgs()
+                .withDescription( "Number of cluster. Default 20." )
+                .create( "c" );
 
 
         Options options = new Options();
         options.addOption(inputOption);
         options.addOption(outputOption);
         options.addOption(modelOption);
+        options.addOption(clusterOption);
 
         // create the parser
         CommandLineParser parser = new BasicParser();
@@ -77,6 +83,7 @@ public class Clustering {
         String inputPath = line.getOptionValue("i");
         String outputPath = line.getOptionValue("o");
         String modelPath = line.getOptionValue("m");
+        Integer clusterNumber = Integer.parseInt(line.getOptionValue("c", "20"));
 
 
         SparkConf sparkConf = new SparkConf().setAppName("Clustering");
@@ -91,7 +98,7 @@ public class Clustering {
 
             DataFrame wordsData = tokenize(inputDf);
 
-            int numFeatures = 20;
+            int numFeatures = 1000;
             HashingTF hashingTF = new HashingTF()
                     .setInputCol("words")
                     .setOutputCol("rawFeatures")
@@ -109,7 +116,8 @@ public class Clustering {
 
             // Trains a k-means model
             KMeans kmeans = new KMeans()
-                    .setK(10)
+                    .setK(clusterNumber)
+                    .setMaxIter(40)
                     .setFeaturesCol("features")
                     .setPredictionCol("prediction");
             KMeansModel model = kmeans.fit(rescaledData);

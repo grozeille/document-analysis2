@@ -42,6 +42,7 @@ import org.bytedeco.javacpp.BytePointer;
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.*;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -102,6 +103,8 @@ public class DocumentAnalysisAvroEncryptedPdf {
         String tesseractPath = line.getOptionValue("t");
         String tesseractLang = line.getOptionValue("l", "fra");
 
+        final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+
 
         SparkConf sparkConf = new SparkConf().setAppName("DocumentAnalysis");
         sparkConf.set("mapreduce.input.fileinputformat.input.dir.recursive","false");
@@ -161,8 +164,8 @@ public class DocumentAnalysisAvroEncryptedPdf {
                                             outputText.append(info.getKeywords()).append("\n");
                                             outputText.append(info.getCreator()).append("\n");
                                             outputText.append(info.getProducer()).append("\n");
-                                            outputText.append(info.getCreationDate()).append("\n");
-                                            outputText.append(info.getModificationDate()).append("\n");
+                                            outputText.append(info.getCreationDate() != null ? dateFormat.format(info.getCreationDate().getTime()) : "").append("\n");
+                                            outputText.append(info.getModificationDate() != null ? dateFormat.format(info.getModificationDate().getTime()) : "").append("\n");
 
                                             outputText.append(this.pdfOcrUtil.parsePdfOcr(path, document)).append("\n");
                                         }
